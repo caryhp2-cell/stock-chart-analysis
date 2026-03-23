@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>📈 個股股價走勢分析</title>
+<script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "Microsoft JhengHei", "PingFang TC", "Noto Sans CJK TC", sans-serif; background: #f7f8fa; color: #333; }
+  .header { background: #1e3c78; color: #fff; padding: 24px 32px; }
+  .header h1 { font-size: 1.6rem; }
+  .header p { font-size: 0.9rem; opacity: 0.8; margin-top: 4px; }
+  .controls { display: flex; align-items: center; gap: 12px; padding: 20px 32px; background: #fff; border-bottom: 1px solid #e0e0e0; flex-wrap: wrap; }
+  .controls input { font-size: 1rem; padding: 10px 14px; border: 2px solid #ccc; border-radius: 6px; width: 200px; }
+  .controls input:focus { border-color: #1e3c78; outline: none; }
+  .controls button { font-size: 1rem; padding: 10px 28px; background: #1e3c78; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+  .controls button:hover { background: #2a4fa0; }
+  .controls button:disabled { background: #999; cursor: not-allowed; }
+  .controls .hint { font-size: 0.85rem; color: #888; }
+  .container { max-width: 100%; margin: 0 auto; padding: 24px 32px; }
+  .section { background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); padding: 24px; margin-bottom: 24px; overflow: hidden; }
+  .section .js-plotly-plot, .section .plot-container, .section .svg-container { width: 100% !important; }
+  .section h2 { font-size: 1.2rem; margin-bottom: 16px; color: #1e3c78; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+  th { background: #f0f2f5; text-align: left; padding: 10px 14px; font-weight: 600; }
+  td { padding: 10px 14px; border-bottom: 1px solid #eee; }
+  tr:hover td { background: #fafbfc; }
+  .error { color: #c0392b; font-size: 1rem; padding: 20px; text-align: center; }
+  .loading { text-align: center; padding: 40px; color: #888; font-size: 1.1rem; }
+  #app { display: none; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>📈 個股股價走勢分析</h1>
+  <p>含 20MA / 60MA 均線、黃金交叉 / 死亡交叉標註，以及十年績效統計</p>
+</div>
+
+<div class="controls">
+  <label for="symbolInput"><strong>股票代碼</strong></label>
+  <input id="symbolInput" type="text" value="2330" placeholder="例如 2330 或 AAPL">
+  <button id="queryBtn" onclick="query()">查詢</button>
+  <span class="hint">台股輸入數字即可（如 2330）；美股直接輸入代碼（如 AAPL）</span>
+</div>
+
+<div class="container">
+  <div id="fileWarning" class="section" style="display:none; text-align:center; padding:40px;">
+    <h2 style="color:#c0392b; margin-bottom:12px;">無法直接開啟 HTML 檔案查詢股價</h2>
+    <p style="font-size:1.05rem; color:#555; line-height:1.8;">
+      瀏覽器安全性限制不允許本地檔案存取外部 API。<br>
+      請改用以下方式啟動（只需要 Python，不需安裝其他套件）：
+    </p>
+    <pre style="background:#f0f2f5; padding:16px; border-radius:6px; display:inline-block; margin:16px 0; font-size:1.1rem; text-align:left;">python server.py</pre>
+    <p style="color:#888;">啟動後瀏覽器會自動開啟 http://localhost:8080</p>
+  </div>
+  <div id="loadingMsg" class="loading" style="display:none;">下載資料中，請稍候…</div>
+  <div id="errorMsg" class="error" style="display:none;"></div>
+
+  <div id="app">
+    <!-- 近半年走勢圖 -->
+    <div class="section">
+      <div id="chartHalfYear"></div>
+    </div>
+
+    <!-- 交叉事件表 -->
+    <div class="section" id="crossEventsSection">
+      <h2>交叉事件</h2>
+      <table id="crossTable"><thead><tr><th>日期</th><th>類型</th><th>價位</th></tr></thead><tbody></tbody></table>
+      <p id="noCrossMsg" style="display:none; color:#888; padding:12px 0;">近半年內無黃金交叉或死亡交叉事件。</p>
+    </div>
+
+    <!-- 十年績效統計 -->
+    <div class="section">
+      <h2>📊 過去十年績效統計</h2>
+      <table id="statsTable"><thead><tr><th>指標</th><th>數值</th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <!-- 十年走勢圖 -->
+    <div class="section">
+      <div id="chart10Year"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── 偵測 file:// 模式 ──
+if (location.protocol === 'file:') {
+  document.getElementById('fileWarning').style.display = 'block';
+  document.querySelector('.controls').style.display = 'none';
+}
+
+// ── 工具函式 ──
+function isDigit(s) { return /^\d+$/.test(s.trim()); }
+function fmt(n) { return n == null ? '資料不足' : n.toFixed(2) + '%'; }
+function fmtDate(ts) { const d = new Date(ts * 1000); return d.toISOString().slice(0, 10); }
+function fmtPrice(p) { return p.toFixed(2); }
+
+function calcMA(prices, window) {
+  const ma = new Array(prices.length).fill(null);
+  for (let i = window - 1; i < prices.length; i++) {
+    let sum = 0;
+    for (let j = i - window + 1; j <= i; j++) sum += prices[j];
+    ma[i] = sum / window;
+  }
+  return ma;
+}
+
+function findCrossovers(ma20, ma60) {
+  const golden = [], death = [];
+  for (let i = 1; i < ma20.length; i++) {
+    if (ma20[i] == null || ma60[i] == null || ma20[i-1] == null || ma60[i-1] == null) continue;
+    const prevDiff = ma20[i-1] - ma60[i-1];
+    const currDiff = ma20[i] - ma60[i];
+    if (prevDiff <= 0 && currDiff > 0) golden.push(i);
+    if (prevDiff >= 0 && currDiff < 0) death.push(i);
+  }
+  return { golden, death };
+}
+
+function calcCAGR(prices, timestamps, nYears) {
+  const lastTs = timestamps[timestamps.length - 1];
+  const cutoff = lastTs - nYears * 365.25 * 86400;
+  let startIdx = -1;
+  for (let i = 0; i < timestamps.length; i++) {
+    if (timestamps[i] >= cutoff) { startIdx = i; break; }
+  }
+  if (startIdx < 0 || startIdx >= timestamps.length - 1) return null;
+  const p0 = prices[startIdx], p1 = prices[prices.length - 1];
+  const years = (timestamps[timestamps.length - 1] - timestamps[startIdx]) / (365.25 * 86400);
+  if (years <= 0 || p0 <= 0) return null;
+  return (Math.pow(p1 / p0, 1 / years) - 1) * 100;
+}
+
+function findTopDrawdowns(prices, timestamps, n) {
+  // 計算 cummax 和 drawdown
+  const cummax = [], drawdown = [];
+  let cmax = -Infinity;
+  for (let i = 0; i < prices.length; i++) {
+    cmax = Math.max(cmax, prices[i]);
+    cummax.push(cmax);
+    drawdown.push((prices[i] - cmax) / cmax);
+  }
+
+  const results = [];
+  const excluded = new Set();
+
+  for (let round = 0; round < n; round++) {
+    let minVal = 0, minIdx = -1;
+    for (let i = 0; i < drawdown.length; i++) {
+      if (excluded.has(i)) continue;
+      if (drawdown[i] < minVal) { minVal = drawdown[i]; minIdx = i; }
+    }
+    if (minIdx < 0) break;
+
+    // peak: highest price before trough
+    let peakIdx = 0;
+    for (let i = 1; i <= minIdx; i++) {
+      if (!excluded.has(i) && prices[i] >= prices[peakIdx]) peakIdx = i;
+    }
+    // Actually find peak more carefully
+    peakIdx = 0;
+    for (let i = 0; i <= minIdx; i++) {
+      if (prices[i] >= prices[peakIdx]) peakIdx = i;
+    }
+
+    // recovery: first point after trough that reaches peak price
+    let recoveryIdx = prices.length - 1;
+    for (let i = minIdx; i < prices.length; i++) {
+      if (prices[i] >= prices[peakIdx]) { recoveryIdx = i; break; }
+    }
+
+    results.push({
+      peakIdx, troughIdx: minIdx, recoveryIdx,
+      peakDate: fmtDate(timestamps[peakIdx]),
+      troughDate: fmtDate(timestamps[minIdx]),
+      drawdown: minVal * 100,
+    });
+
+    // exclude this range
+    for (let i = peakIdx; i <= recoveryIdx; i++) excluded.add(i);
+  }
+  return results;
+}
+
+// ── 資料抓取（自動偵測：本地 server 或 CORS proxy）──
+function parseYahooJson(json) {
+  const result = json.chart?.result?.[0];
+  if (!result) throw new Error('無法取得資料');
+  const timestamps = result.timestamp;
+  const close = result.indicators.quote[0].close;
+  const filtered = { timestamps: [], prices: [] };
+  for (let i = 0; i < timestamps.length; i++) {
+    if (close[i] != null) {
+      filtered.timestamps.push(timestamps[i]);
+      filtered.prices.push(close[i]);
+    }
+  }
+  if (filtered.prices.length === 0) throw new Error('無有效資料');
+  return filtered;
+}
+
+const CORS_PROXIES = [
+  url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+];
+
+async function fetchYahoo(ticker, range) {
+  const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=${range}&interval=1d`;
+
+  // 1) 嘗試本地 server.py 代理
+  if (location.protocol === 'http:' || location.protocol === 'https:') {
+    try {
+      const localUrl = `/api/chart?ticker=${encodeURIComponent(ticker)}&range=${encodeURIComponent(range)}`;
+      const resp = await fetch(localUrl, { signal: AbortSignal.timeout(5000) });
+      if (resp.ok) return parseYahooJson(await resp.json());
+    } catch (e) { /* fallback to CORS proxy */ }
+  }
+
+  // 2) Fallback: CORS proxy
+  let lastErr;
+  for (const makeProxy of CORS_PROXIES) {
+    try {
+      const resp = await fetch(makeProxy(yahooUrl), { signal: AbortSignal.timeout(15000) });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      return parseYahooJson(await resp.json());
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('無法取得資料');
+}
+
+// ── 主查詢 ──
+async function query() {
+  const btn = document.getElementById('queryBtn');
+  const input = document.getElementById('symbolInput').value.trim();
+  if (!input) return;
+
+  const ticker = isDigit(input) ? input + '.TW' : input;
+
+  btn.disabled = true;
+  btn.textContent = '查詢中…';
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('errorMsg').style.display = 'none';
+  document.getElementById('loadingMsg').style.display = 'block';
+
+  try {
+    // 同時抓兩組資料
+    const [data1y, data10y] = await Promise.all([
+      fetchYahoo(ticker, '1y'),
+      fetchYahoo(ticker, '10y'),
+    ]);
+
+    renderHalfYear(ticker, data1y);
+    renderTenYear(ticker, data10y);
+
+    document.getElementById('app').style.display = 'block';
+    document.getElementById('loadingMsg').style.display = 'none';
+  } catch (e) {
+    document.getElementById('loadingMsg').style.display = 'none';
+    document.getElementById('errorMsg').textContent = `找不到 ${ticker} 的資料，請確認代碼是否正確。(${e.message})`;
+    document.getElementById('errorMsg').style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '查詢';
+  }
+}
+
+// ── 近半年走勢圖 ──
+function renderHalfYear(ticker, data) {
+  const { timestamps, prices } = data;
+  const ma20 = calcMA(prices, 20);
+  const ma60 = calcMA(prices, 60);
+
+  // 截取近 180 天
+  const cutoff = timestamps[timestamps.length - 1] - 180 * 86400;
+  let startIdx = 0;
+  for (let i = 0; i < timestamps.length; i++) {
+    if (timestamps[i] >= cutoff) { startIdx = i; break; }
+  }
+
+  const dates = timestamps.slice(startIdx).map(t => fmtDate(t));
+  const closeSlice = prices.slice(startIdx);
+  const ma20Slice = ma20.slice(startIdx);
+  const ma60Slice = ma60.slice(startIdx);
+
+  // 交叉偵測（在截取後的資料上）
+  const cross = findCrossovers(ma20Slice, ma60Slice);
+
+  // 過濾 null 值，避免 Plotly 軸範圍異常
+  function filterValid(xArr, yArr) {
+    const fx = [], fy = [];
+    for (let i = 0; i < yArr.length; i++) {
+      if (yArr[i] != null) { fx.push(xArr[i]); fy.push(yArr[i]); }
+    }
+    return { x: fx, y: fy };
+  }
+  const ma20F = filterValid(dates, ma20Slice);
+  const ma60F = filterValid(dates, ma60Slice);
+
+  const traces = [
+    { x: dates, y: closeSlice, name: '收盤價', line: { color: 'steelblue', width: 1.5 } },
+    { x: ma20F.x, y: ma20F.y, name: '20MA', line: { color: 'orange', width: 1 } },
+    { x: ma60F.x, y: ma60F.y, name: '60MA', line: { color: 'purple', width: 1 } },
+  ];
+
+  if (cross.golden.length > 0) {
+    traces.push({
+      x: cross.golden.map(i => dates[i]),
+      y: cross.golden.map(i => ma20Slice[i]),
+      mode: 'markers+text', name: '黃金交叉',
+      marker: { symbol: 'triangle-up', size: 14, color: 'green' },
+      text: cross.golden.map(() => '黃金交叉'),
+      textposition: 'top center',
+      textfont: { color: 'green', size: 11 },
+    });
+  }
+  if (cross.death.length > 0) {
+    traces.push({
+      x: cross.death.map(i => dates[i]),
+      y: cross.death.map(i => ma20Slice[i]),
+      mode: 'markers+text', name: '死亡交叉',
+      marker: { symbol: 'triangle-down', size: 14, color: 'red' },
+      text: cross.death.map(() => '死亡交叉'),
+      textposition: 'bottom center',
+      textfont: { color: 'red', size: 11 },
+    });
+  }
+
+  Plotly.newPlot('chartHalfYear', traces, {
+    title: `${ticker} 近半年股價走勢（含 20MA / 60MA）`,
+    xaxis: { title: '日期', type: 'date', autorange: true, rangeslider: { visible: false } },
+    yaxis: { title: '價格' },
+    hovermode: 'x unified', template: 'plotly_white', height: 550,
+    margin: { l: 60, r: 20, t: 50, b: 60 },
+    legend: { orientation: 'h', y: -0.15, x: 0.5, xanchor: 'center' },
+  }, { responsive: true });
+
+  // 交叉事件表
+  const tbody = document.querySelector('#crossTable tbody');
+  tbody.innerHTML = '';
+  const events = [];
+  cross.golden.forEach(i => events.push({ date: dates[i], type: '🟢 黃金交叉', price: fmtPrice(ma20Slice[i]) }));
+  cross.death.forEach(i => events.push({ date: dates[i], type: '🔴 死亡交叉', price: fmtPrice(ma20Slice[i]) }));
+  events.sort((a, b) => a.date.localeCompare(b.date));
+
+  if (events.length > 0) {
+    document.querySelector('#crossTable').style.display = '';
+    document.getElementById('noCrossMsg').style.display = 'none';
+    events.forEach(e => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${e.date}</td><td>${e.type}</td><td>${e.price}</td>`;
+      tbody.appendChild(tr);
+    });
+  } else {
+    document.querySelector('#crossTable').style.display = 'none';
+    document.getElementById('noCrossMsg').style.display = '';
+  }
+}
+
+// ── 十年績效統計 ──
+function renderTenYear(ticker, data) {
+  const { timestamps, prices } = data;
+  const firstPrice = prices[0], lastPrice = prices[prices.length - 1];
+  const firstDate = fmtDate(timestamps[0]), lastDate = fmtDate(timestamps[timestamps.length - 1]);
+  const years = (timestamps[timestamps.length - 1] - timestamps[0]) / (365.25 * 86400);
+
+  const totalReturn = (lastPrice / firstPrice - 1) * 100;
+  const cagr3 = calcCAGR(prices, timestamps, 3);
+  const cagr5 = calcCAGR(prices, timestamps, 5);
+  const cagr10 = calcCAGR(prices, timestamps, 10);
+  const topDDs = findTopDrawdowns(prices, timestamps, 3);
+
+  // 統計表
+  const rows = [
+    ['資料期間', years.toFixed(1) + ' 年'],
+    [`起始價格（${firstDate}）`, fmtPrice(firstPrice)],
+    [`最新價格（${lastDate}）`, fmtPrice(lastPrice)],
+    ['總報酬率', fmt(totalReturn)],
+    ['3 年 CAGR', fmt(cagr3)],
+    ['5 年 CAGR', fmt(cagr5)],
+    ['10 年 CAGR', fmt(cagr10)],
+  ];
+  const ranks = ['最大', '第二大', '第三大'];
+  topDDs.forEach((dd, i) => {
+    rows.push([`${ranks[i]}跌幅`, `${dd.drawdown.toFixed(2)}%（${dd.peakDate} → ${dd.troughDate}）`]);
+  });
+
+  const tbody = document.querySelector('#statsTable tbody');
+  tbody.innerHTML = '';
+  rows.forEach(([label, val]) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><strong>${label}</strong></td><td>${val}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  // 十年走勢圖
+  const dates = timestamps.map(t => fmtDate(t));
+  const traces = [{
+    x: dates, y: prices, name: '收盤價',
+    line: { color: 'steelblue', width: 1.2 },
+    fill: 'tozeroy', fillcolor: 'rgba(70,130,180,0.1)',
+  }];
+
+  const ddColors = [
+    ['red', 'rgba(255,0,0,0.12)'],
+    ['darkorange', 'rgba(255,140,0,0.10)'],
+    ['goldenrod', 'rgba(218,165,32,0.08)'],
+  ];
+  topDDs.forEach((dd, i) => {
+    const sliceDates = [], slicePrices = [];
+    for (let j = dd.peakIdx; j <= dd.troughIdx; j++) {
+      sliceDates.push(dates[j]);
+      slicePrices.push(prices[j]);
+    }
+    traces.push({
+      x: sliceDates, y: slicePrices,
+      name: `${ranks[i]}跌幅 (${dd.drawdown.toFixed(1)}%)`,
+      line: { color: ddColors[i][0], width: 1.5 },
+      fill: 'tozeroy', fillcolor: ddColors[i][1],
+    });
+  });
+
+  Plotly.newPlot('chart10Year', traces, {
+    title: `${ticker} 過去十年股價走勢`,
+    xaxis: { title: '日期', type: 'date', autorange: true, rangeslider: { visible: false } },
+    yaxis: { title: '價格' },
+    hovermode: 'x unified', template: 'plotly_white', height: 400,
+    margin: { l: 60, r: 20, t: 50, b: 60 },
+    legend: { orientation: 'h', y: -0.2, x: 0.5, xanchor: 'center' },
+  }, { responsive: true });
+}
+
+// Enter 鍵觸發查詢
+document.getElementById('symbolInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') query();
+});
+
+// 確保圖表撐滿容器
+window.addEventListener('resize', () => {
+  document.querySelectorAll('.js-plotly-plot').forEach(el => Plotly.Plots.resize(el));
+});
+
+// 渲染後強制 resize
+const origQuery = query;
+query = async function() {
+  await origQuery();
+  setTimeout(() => {
+    document.querySelectorAll('.js-plotly-plot').forEach(el => Plotly.Plots.resize(el));
+  }, 100);
+};
+</script>
+</body>
+</html>
